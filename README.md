@@ -1,5 +1,7 @@
 # Artifact of "Structured Coroutines for the Wafer-Scale Engine"
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24194715.svg)](https://doi.org/10.5281/zenodo.24194715)
+
 This is the artifact of the paper
 
 > Tim Noack and Andreas Koch. Structured Coroutines for the Wafer-Scale Engine. In Proceedings of the 2027 IEEE/ACM International Symposium on Code Generation and Optimization (CGO '27), Salt Lake City, UT, USA, 2027.
