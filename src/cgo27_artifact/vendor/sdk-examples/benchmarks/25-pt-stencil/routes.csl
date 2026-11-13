@@ -1,0 +1,137 @@
+// Copyright 2025 Cerebras Systems.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+const directions = @import_module("<directions>");
+const util = @import_module("util.csl");
+
+param pattern: u16;
+param peWidth: u16;
+param peHeight: u16;
+
+const PopModeConfig = struct {
+  always_pop: bool,
+};
+
+const SwitchConfig = struct {
+  pos1: u16,           // bitvector, 0 = invalid
+  pos2: u16,           // bitvector, 0 = invalid
+  pos3: u16,           // bitvector, 0 = invalid
+  ring_mode: bool,
+  current_switch_pos: u16,
+  pop_mode: PopModeConfig,
+};
+
+const RouteConfig = struct {
+  routes: u16,         // combined RX+TX bitvector
+  switches: SwitchConfig,
+};
+
+fn initialSwitchPosition(pattFirst: bool, pattLast: bool) u16 {
+  if (pattern == 2) {
+    if (pattFirst) {
+      return 0;
+    }
+    return 2;
+  }
+  if (pattFirst) {
+    return 1;
+  }
+  if (pattLast) {
+    return 3;
+  }
+  return 0;
+}
+
+fn computeTxBits(dir: direction, isLast: bool) u16 {
+  if (!isLast) {
+    return directions.dirToTxBits(dir) | directions.TX_RAMP;
+  }
+  return directions.TX_RAMP;
+}
+
+// The route when using a single neibhbor is quite different from the route for
+// non-unit neighbors.  The next two functions compute routes for these two
+// cases.
+fn twoPatternRoute(dir: direction, pattFirst: bool, pattLast: bool,
+    isLast: bool) RouteConfig {
+  return RouteConfig{
+    .routes = directions.RX_RAMP | computeTxBits(dir, isLast),
+    .switches = SwitchConfig{
+        .pos1 = directions.TX_RAMP,
+        .pos2 = directions.dirToRxBits(directions.flip(dir)),
+        .pos3 = 0,
+        .ring_mode = true,
+        .current_switch_pos = initialSwitchPosition(pattFirst, pattLast, 2),
+        .pop_mode = PopModeConfig{ .always_pop = true },
+    },
+  };
+}
+
+fn genericRoute(dir: direction, notNeedsPos3: bool, pattFirst: bool,
+    pattLast: bool, isLast: bool) RouteConfig {
+  // The first `pattern - 1` PEs always forward, unless they're at the edge.
+  const rxBits = directions.dirToRxBits(directions.flip(dir));
+  const txBits = computeTxBits(dir, isLast);
+
+  if (notNeedsPos3) {
+    return RouteConfig{
+      .routes = rxBits | txBits,
+      .switches = SwitchConfig{
+          .pos1 = directions.RX_RAMP,
+          .pos2 = directions.TX_RAMP,
+          .pos3 = 0,
+          .ring_mode = true,
+          .current_switch_pos = 0,
+          .pop_mode = PopModeConfig{ .always_pop = true },
+      }
+    };
+  }
+
+  return RouteConfig{
+    .routes = rxBits | txBits,
+    .switches = SwitchConfig{
+        .pos1 = directions.RX_RAMP,
+        .pos2 = directions.TX_RAMP,
+        .pos3 = directions.dirToRxBits(directions.flip(dir)),
+        .ring_mode = true,
+        .current_switch_pos = initialSwitchPosition(pattFirst, pattLast),
+        .pop_mode = PopModeConfig{ .always_pop = true },
+    }
+  };
+}
+
+// This is the top-level function for computing the routes and switches.
+fn computeRoute(dir: direction, isFirst: bool, isLast: bool, notNeedsPos3: bool,
+    pattFirst: bool, pattLast: bool) RouteConfig {
+  if (isFirst) {
+    // The first PE only sends, never receives.
+    return RouteConfig{
+      .routes = directions.RX_RAMP | directions.dirToTxBits(dir) | directions.TX_RAMP,
+      .switches = SwitchConfig{
+          .pos1 = directions.TX_RAMP,
+          .pos2 = 0,
+          .pos3 = 0,
+          .ring_mode = true,
+          .current_switch_pos = 0,
+          .pop_mode = PopModeConfig{ .always_pop = true },
+      }
+    };
+  }
+
+  if (pattern == 2) {
+    return twoPatternRoute(dir, pattFirst, pattLast, isLast);
+  }
+
+  return genericRoute(dir, notNeedsPos3, pattFirst, pattLast, isLast);
+}

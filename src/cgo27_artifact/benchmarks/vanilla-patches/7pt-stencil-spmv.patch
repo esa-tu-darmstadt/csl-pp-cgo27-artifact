@@ -1,0 +1,29 @@
+diff -ruN ga/7pt-stencil-spmv/src/kernel.csl gb/7pt-stencil-spmv/src/kernel.csl
+--- ga/7pt-stencil-spmv/src/kernel.csl	2026-04-20 21:32:26.000000000 +0000
++++ gb/7pt-stencil-spmv/src/kernel.csl	2026-11-12 10:53:08.465101102 +0000
+@@ -44,7 +44,7 @@
+ // output queue cannot overlap input queues
+ const stencil_mod = @import_module( "../../benchmark-libs/stencil_3d_7pts/pe.csl", .{
+      .stencil_params = stencilParams,
+-     .f_callback = sys_mod.unblock_cmd_stream,
++     .f_callback = f_spmv_done,
+      .input_queues = [4]u16{4, 5, 6, 7},
+      .output_queues = if (@is_arch("wse3")) [4]u16{4, 5, 6, 7} else [1]u16{3},
+      .output_ut_id = 3,
+@@ -130,7 +130,16 @@
+ 
+ // stencil coefficients are organized as
+ // {c_west, c_east, c_south, c_north, c_bottom, c_top, c_center}
++// Both timestamps are taken on device, inside the single RPC that runs the
++// SpMV: bracketing it with separate f_tic/f_toc commands would put two host
++// round trips inside the measured window.
++fn f_spmv_done() void {
++    timestamp.get_timestamp(&tscEndBuffer);
++    sys_mod.unblock_cmd_stream();
++}
++
+ fn f_spmv(n:i16) void {
++    timestamp.get_timestamp(&tscStartBuffer);
+     stencil_mod.spmv(n, &stencil_coeff, &x, &y);
+ }
+ 

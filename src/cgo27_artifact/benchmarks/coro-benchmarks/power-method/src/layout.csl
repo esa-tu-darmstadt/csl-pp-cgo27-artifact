@@ -1,0 +1,108 @@
+
+param MAX_ZDIM: i16 = 5; // maximum size of local vector x and y
+param width: i16 = 5;    // width of the core
+param height: i16 = 5;   // height of the core
+
+param BLOCK_SIZE: i16 = 2; // size of temporary buffers for communication
+
+// Entry point of the root coroutine task; worker tasks use subsequent IDs.
+const STATE: local_task_id = @get_local_task_id(12);
+
+// Stencil and allreduce: routing colors and entrypoints are claimed inside
+// each lib's layout module — nothing to thread through here.
+const stencil = @import_module( "../../benchmark-libs/stencil_3d_7pts/layout.csl", .{
+    .width = width,
+    .height = height
+    });
+
+const reduce = @import_module( "../../benchmark-libs/allreduce/layout.csl", .{
+    .width = width,
+    .height = height
+    });
+
+const memcpy = @import_module( "<memcpy/get_params>", .{
+    .width = width,
+    .height = height,
+    });
+
+layout{
+
+    // step 1: configure the rectangle which does not include halo
+    @set_rectangle( width, height );
+
+    // step 2: compile csl code for a set of PEx.y and generate out_x_y.elf
+    //   format: @set_tile_code(x, y, code.csl, param_binding);
+
+    var py: i16 = 0;
+    while(py < height) : (py +=1) {
+        var px: i16 = 0;
+        while(px < width) : (px +=1) {
+
+            const memcpyParams = memcpy.get_params(px);
+            const stencilBaseParams = stencil.get_params(px, py);
+            const reduceBaseParams = reduce.get_params(px, py);
+            const reduceParams = .{
+                .first_px = reduceBaseParams.first_px,
+                .last_px = reduceBaseParams.last_px,
+                .first_py = reduceBaseParams.first_py,
+                .last_py = reduceBaseParams.last_py,
+                .C_ROUTE = reduceBaseParams.C_ROUTE,
+                .width = reduceBaseParams.width,
+                .height = reduceBaseParams.height,
+                .queues = [1]u16{2},
+                .dest_dsr_ids = [1]u16{1},
+                .src0_dsr_ids = [1]u16{1},
+                .src1_dsr_ids = [1]u16{1},
+            };
+            const stencilParams = .{
+                .c_recv_west = stencilBaseParams.c_recv_west,
+                .c_send_east = stencilBaseParams.c_send_east,
+                .c_recv_east = stencilBaseParams.c_recv_east,
+                .c_send_west = stencilBaseParams.c_send_west,
+                .c_recv_south = stencilBaseParams.c_recv_south,
+                .c_send_north = stencilBaseParams.c_send_north,
+                .c_recv_north = stencilBaseParams.c_recv_north,
+                .c_send_south = stencilBaseParams.c_send_south,
+                .first_px = stencilBaseParams.first_px,
+                .last_px = stencilBaseParams.last_px,
+                .first_py = stencilBaseParams.first_py,
+                .last_py = stencilBaseParams.last_py,
+                .input_queues = [4]u16{4, 5, 6, 7},
+                .output_queues = if (@is_arch("wse3")) [4]u16{4, 5, 6, 7} else [1]u16{3},
+                .output_ut_id = 3,
+                .BLOCK_SIZE = BLOCK_SIZE,
+                .dest_dsr_ids = [2]u16{2,3},
+                .src0_dsr_ids = [1]u16{2},
+                .src1_dsr_ids = [2]u16{2,3},
+            };
+            const params = .{
+                .memcpyParams = memcpyParams,
+                .reduceParams = reduceParams,
+                .MAX_ZDIM = MAX_ZDIM,
+                .BLOCK_SIZE = BLOCK_SIZE,
+                .stencilParams = stencilParams,
+                .STATE = STATE,
+            };
+
+            @set_tile_code(px, py, "kernel_power_coro.csl", params);
+        }
+    }
+
+    @export_name("x", [*]f32, true);
+    @export_name("y", [*]f32, true);
+    @export_name("stencil_coeff", [*]f32, true);
+    @export_name("time_buf_u16", [*]u16, true);
+    @export_name("time_ref", [*]u16, true);
+
+    @export_name("f_enable_timer", fn()void);
+    @export_name("f_tic", fn()void);
+    @export_name("f_toc", fn()void);
+    @export_name("f_memcpy_timestamps", fn()void);
+
+    @export_name("f_sync", fn()void);
+    @export_name("f_power", fn(i16,i16)void);
+
+    @export_name("f_reference_timestamps", fn()void);
+
+    @export_name("f_init", fn()void);
+} // end of layout

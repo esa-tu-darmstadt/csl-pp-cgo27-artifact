@@ -1,0 +1,462 @@
+// Allreduce module using coroutines.
+//
+// Provides two async operations for use with `@await`:
+//   async_allreduce(n, tensor, op)  — reduce + broadcast a vector of n elements
+//   async_allreduce_nrm2(val)       — compute global L2 norm, returns result
+//
+// Architecture:
+//   Each hardware phase (row-reduce, col-reduce, broadcast) uses
+//   @await_parallel to join two independent events:
+//     1. The DSD operation chain (data movement on a dedicated worker)
+//     2. The teardown wavelet arrival (on a second worker)
+//   No explicit task IDs are needed — the coroutine worker pool handles
+//   all task allocation automatically.
+
+param C_ROUTE: color;
+
+param first_px: bool;
+param last_px: bool;
+param first_py: bool;
+param last_py: bool;
+
+param width: i16;
+param height: i16;
+
+param queues: [1]u16;
+
+param dest_dsr_ids: [1]u16;
+param src0_dsr_ids: [1]u16;
+param src1_dsr_ids: [1]u16;
+
+const timestamp = @import_module("<time>");
+const math_lib = @import_module("<math>");
+
+const TYPE_BINARY_OP = enum(u16) { ADD, MAX };
+
+var tscRefBuffer = @zeros([timestamp.tsc_size_words]u16);
+
+////////////////////////////////////////////////////////////////////////////////
+// Module state
+////////////////////////////////////////////////////////////////////////////////
+
+var x: [*]f32;
+var functor: TYPE_BINARY_OP = TYPE_BINARY_OP.ADD;
+var wvlts_per_pe: u16 = 0;
+
+////////////////////////////////////////////////////////////////////////////////
+// DSDs and hardware resources
+////////////////////////////////////////////////////////////////////////////////
+
+const dest_dsr = @get_dsr(dsr_dest, dest_dsr_ids[0]);
+const src0_dsr = @get_dsr(dsr_src0, src0_dsr_ids[0]);
+const src1_dsr = @get_dsr(dsr_src1, src1_dsr_ids[0]);
+
+const iq_route = @get_input_queue(queues[0]);
+const oq_route = @get_output_queue(queues[0]);
+
+const dummy = @zeros([1]i16);
+
+var mem_x_buf_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> dummy[i] });
+
+var fab_trans_x_wdsd = @get_dsd(fabout_dsd, .{
+    .extent = 1,
+    .fabric_color = C_ROUTE,
+    .output_queue = oq_route
+});
+
+const fab_trans_ctrl_wdsd = @get_dsd(fabout_dsd, .{
+    .extent = 1,
+    .control = true,
+    .fabric_color = C_ROUTE,
+    .output_queue = oq_route
+});
+
+var fab_recv_wdsd = @get_dsd(fabin_dsd, .{
+   .extent = 1,
+   .fabric_color = C_ROUTE,
+   .input_queue = iq_route
+});
+
+const switches = @import_module("<memcpy/memcpy_switches>");
+
+var ctrl_11 = [1]u32{ switches.ctrl(switches.switch_cmd_11()) };
+var mem_ctrl_buf_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> ctrl_11[i] });
+
+const teardown_buf = [1]u32{ switches.ctrl(switches.teardown_cmd_1()) };
+const mem_buf_td_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> teardown_buf[i] });
+
+////////////////////////////////////////////////////////////////////////////////
+// Public async API
+////////////////////////////////////////////////////////////////////////////////
+
+// Perform allreduce(op) on a vector of n elements.
+// After completion, every PE holds the same reduced values in in_tensor[0..n].
+async fn async_allreduce(n: i16, in_tensor: [*]f32, op: TYPE_BINARY_OP) void {
+    @assert(n > 0);
+    x = in_tensor;
+    functor = op;
+    wvlts_per_pe = @bitcast(u16, n);
+
+    @await(async_row_reduce(wvlts_per_pe));
+    @await(async_col_reduce(wvlts_per_pe));
+    @await(async_broadcast(wvlts_per_pe));
+
+    timestamp.get_timestamp(&tscRefBuffer);
+}
+
+// Compute the global L2 norm of a scalar distributed across all PEs.
+//
+// Each PE provides its local value val. Returns ||v||_2 where v is the vector
+// of all PEs' values. Uses a numerically stable algorithm:
+//   1. allreduce(MAX, |v_j|)        — find global maximum for scaling
+//   2. (|v_j| / alpha)^2            — scale each PE's value to avoid overflow
+//   3. allreduce(ADD, scaled^2)     — sum of squares across all PEs
+//   4. alpha * sqrt(sum)            — undo scaling
+async fn async_allreduce_nrm2(val: f32) f32 {
+    // Working buffer on the coroutine frame. DSD operations read/write
+    // through x, which points here. The frame persists across suspends.
+    var buf: f32 = math_lib.abs(val);
+    const local_abs = buf;
+    x = @ptrcast([*]f32, &buf);
+    wvlts_per_pe = 1;
+
+    // Step 1: allreduce(MAX) — find max(|v_j|)
+    functor = TYPE_BINARY_OP.MAX;
+
+    @await(async_row_reduce(wvlts_per_pe));
+    @await(async_col_reduce(wvlts_per_pe));
+    @await(async_broadcast(wvlts_per_pe));
+
+    // buf = max(|v_j|) on all PEs
+
+    // Step 2: scale and square (sequential — no suspend)
+    var alpha_val: f32 = 0.0;
+    var inv_alpha_val: f32 = 0.0;
+    approx(buf, &alpha_val, &inv_alpha_val);
+    buf = local_abs * inv_alpha_val;
+    buf = buf * buf;
+
+    // Step 3: allreduce(ADD) — sum of (|v_j| / alpha)^2
+    functor = TYPE_BINARY_OP.ADD;
+
+    @await(async_row_reduce(wvlts_per_pe));
+    @await(async_col_reduce(wvlts_per_pe));
+    @await(async_broadcast(wvlts_per_pe));
+
+    // buf = sum((|v_j| / alpha)^2) on all PEs
+
+    // Step 4: nrm2 = alpha * sqrt(sum)
+    buf = math_lib.sqrt(buf) * alpha_val;
+
+    timestamp.get_timestamp(&tscRefBuffer);
+    return buf;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Internal: teardown waiter
+////////////////////////////////////////////////////////////////////////////////
+
+// Task ID of the task that waits for the teardown wavelet to receive
+var td_waiter_task: local_task_id;
+var td_received: bool = false;
+var td_awaiting: bool = false;
+
+// Runs on a dedicated worker. Stashes its task ID in td_waiter_task so the
+// teardown handler can @activate it. Completes when teardown arrives.
+async fn async_wait_teardown() void {
+    td_waiter_task = @current_task();
+    suspend;
+}
+
+fn teardown_allreduce() void {
+    td_received = true;
+    if(td_awaiting) {
+        @activate(td_waiter_task);
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Internal: async phase functions
+////////////////////////////////////////////////////////////////////////////////
+
+async fn async_row_reduce(n: u16) void {
+    rowReduce_configure();
+    setup_reduce_dsds(n);
+
+    td_received = false;
+    td_awaiting = false;
+
+    @await(async_reduce_dsd(width - 1, first_px, last_px));
+    
+    if(!td_received) {
+        td_waiter_task = @current_task();
+        td_awaiting = true;
+        suspend;
+    }
+}
+
+async fn async_col_reduce(n: u16) void {
+    colReduce_configure();
+    setup_reduce_dsds(n);
+
+    td_received = false;
+    td_awaiting = false;
+
+    @await(async_reduce_dsd(height - 1, first_py, last_py));
+
+    if(!td_received) {
+        td_waiter_task = @current_task();
+        td_awaiting = true;
+        suspend;
+        td_awaiting = false;
+    }
+}
+
+async fn async_broadcast(n: u16) void {
+    bcast_configure();
+    setup_broadcast_dsds(n);
+
+    td_received = false;
+    td_awaiting = false;
+
+    @await(async_broadcast_dsd());
+
+    if(!td_received) {
+        td_waiter_task = @current_task();
+        td_awaiting = true;
+        suspend;
+        td_awaiting = false;
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Internal: DSD setup helpers
+////////////////////////////////////////////////////////////////////////////////
+
+fn setup_reduce_dsds(n: u16) void {
+    mem_ctrl_buf_dsd = @set_dsd_base_addr(mem_ctrl_buf_dsd, ctrl_11);
+    mem_x_buf_dsd = @set_dsd_base_addr(mem_x_buf_dsd, x);
+    mem_x_buf_dsd = @set_dsd_length(mem_x_buf_dsd, n);
+    fab_recv_wdsd = @set_dsd_length(fab_recv_wdsd, n);
+    fab_trans_x_wdsd = @set_dsd_length(fab_trans_x_wdsd, n);
+}
+
+fn setup_broadcast_dsds(n: u16) void {
+    mem_x_buf_dsd = @set_dsd_base_addr(mem_x_buf_dsd, x);
+    mem_x_buf_dsd = @set_dsd_length(mem_x_buf_dsd, n);
+    fab_recv_wdsd = @set_dsd_length(fab_recv_wdsd, n);
+    fab_trans_x_wdsd = @set_dsd_length(fab_trans_x_wdsd, n);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Internal: DSD chain coroutines (run on dedicated workers)
+////////////////////////////////////////////////////////////////////////////////
+
+// Reduce DSD chain. Last PE accumulates from neighbors; others send data
+// then switch-advance. Uses .activate=@current_task() which targets this
+// worker's task ID, not the caller's.
+async fn async_reduce_dsd(num_reduce_pes: i16, comptime is_first_pe: bool, comptime is_last_pe: bool) void {
+    if (is_last_pe) {
+        // Last PE: receive and accumulate from each neighbor.
+        var i: i16 = 0;
+        while (i < num_reduce_pes) : (i += 1) {
+            @load_to_dsr(src1_dsr, fab_recv_wdsd, .{.async=true, .activate=@current_task()});
+            @load_to_dsr(src0_dsr, mem_x_buf_dsd);
+            @load_to_dsr(dest_dsr, mem_x_buf_dsd);
+            if (TYPE_BINARY_OP.ADD == functor) {
+                @fadds(dest_dsr, src0_dsr, src1_dsr, .{.async=true});
+            } else {
+                @fmaxs(dest_dsr, src0_dsr, src1_dsr, .{.async=true});
+            }
+            suspend;
+        }
+    } else {
+        // Non-last PE: send data (stalls until switch advance from left gives us rx=RAMP).
+        @load_to_dsr(dest_dsr, fab_trans_x_wdsd, .{.async=true, .activate=@current_task()});
+        @load_to_dsr(src1_dsr, mem_x_buf_dsd);
+        @mov32(dest_dsr, src1_dsr, .{.async=true});
+        suspend;
+        // Data sent. Now send switch-advance control wavelet to right neighbor.
+        @load_to_dsr(dest_dsr, fab_trans_ctrl_wdsd, .{.async=true, .activate=@current_task()});
+        @load_to_dsr(src1_dsr, mem_ctrl_buf_dsd);
+        @mov32(dest_dsr, src1_dsr, .{.async=true});
+        suspend;
+        // First PE sends teardown to signal phase completion globally.
+        if (is_first_pe) {
+            @load_to_dsr(dest_dsr, fab_trans_ctrl_wdsd, .{.async=true});
+            @load_to_dsr(src1_dsr, mem_buf_td_dsd);
+            @mov32(dest_dsr, src1_dsr, .{.async=true});
+        }
+    }
+}
+
+// Broadcast DSD chain. Right-bottom PE sends data then teardown;
+// other PEs receive data.
+async fn async_broadcast_dsd() void {
+    if (last_px and last_py) {
+        // Right-bottom PE: send data, then send teardown.
+        @load_to_dsr(dest_dsr, fab_trans_x_wdsd, .{.async=true, .activate=@current_task()});
+        @load_to_dsr(src1_dsr, mem_x_buf_dsd);
+        @mov32(dest_dsr, src1_dsr, .{.async=true});
+        suspend;
+        @load_to_dsr(dest_dsr, fab_trans_ctrl_wdsd, .{.async=true});
+        @load_to_dsr(src1_dsr, mem_buf_td_dsd);
+        @mov32(dest_dsr, src1_dsr, .{.async=true});
+    } else {
+        // Other PEs: receive data.
+        @load_to_dsr(dest_dsr, mem_x_buf_dsd);
+        @load_to_dsr(src1_dsr, fab_recv_wdsd, .{.async=true, .activate=@current_task()});
+        @mov32(dest_dsr, src1_dsr, .{.async=true});
+        suspend;
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Internal: math helpers
+////////////////////////////////////////////////////////////////////////////////
+
+// Approximate x by a power of 2: alpha = 2^floor(log2(|x|)).
+// Division by alpha is exact (only shifts the exponent, no precision loss).
+// Handles normal, subnormal, zero, inf, and NaN inputs.
+fn approx(x_val: f32, out_alpha: *f32, out_inv_alpha: *f32) void {
+   const MASK_EXPONENT: u32 = 0x7F800000;
+   const MASK_MANTISSA: u32 = 0x007FFFFF;
+   const x_u32: u32 = @bitcast(u32, x_val);
+   const exp: u32 = (x_u32 & MASK_EXPONENT);
+   const mantissa: u32 = (x_u32) & MASK_MANTISSA;
+   var E: u16 = @as(u16, (exp >> 23));
+
+   if (0 == E) {
+        if (0 == mantissa) {
+            E = 127; // x = 0 → alpha = 1
+        } else {
+            E = 1;   // subnormal → alpha = 2^(-126)
+        }
+    }
+    if (255 == E) {
+        E = 127; // inf/NaN → alpha = 1
+    }
+
+    var alpha_u32: u32 = (@as(u32, E) << 23);
+    var inv_alpha_u32: u32 = @as(u32, (254 - E)) << 23;
+
+    out_alpha.* = @bitcast(f32, alpha_u32);
+    out_inv_alpha.* = @bitcast(f32, inv_alpha_u32);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Routing configuration
+////////////////////////////////////////////////////////////////////////////////
+
+const tile_config = @import_module("<tile_config>");
+const color_config = tile_config.color_config;
+const switch_config = tile_config.switch_config;
+
+fn rowReduce_configure() void {
+    const addr = color_config.get_color_config_addr(C_ROUTE);
+
+    if (first_px) {
+        color_config.reset_routes(addr, .{.tx = EAST, .rx = RAMP});
+    } else if (last_px) {
+        color_config.reset_routes(addr, .{.tx = RAMP, .rx = WEST});
+    } else {
+        color_config.reset_routes(addr, .{.tx = EAST, .rx = WEST});
+    }
+
+    switch_config.clear_current_position(C_ROUTE);
+    switch_config.set_invalid_for_all_switch_positions(C_ROUTE);
+
+    if (last_px) {
+    } else {
+        switch_config.set_rx_switch_pos1(C_ROUTE, RAMP);
+    }
+
+    tile_config.teardown.exit(C_ROUTE);
+}
+
+fn colReduce_configure() void {
+    const addr = color_config.get_color_config_addr(C_ROUTE);
+
+    if (first_py) {
+        color_config.reset_routes(addr, .{.tx = SOUTH, .rx = RAMP});
+    } else if (last_py) {
+        color_config.reset_routes(addr, .{.tx = RAMP, .rx = NORTH});
+    } else {
+        color_config.reset_routes(addr, .{.tx = SOUTH, .rx = NORTH});
+    }
+
+    switch_config.clear_current_position(C_ROUTE);
+    switch_config.set_invalid_for_all_switch_positions(C_ROUTE);
+
+    if (last_py) {
+    } else {
+        switch_config.set_rx_switch_pos1(C_ROUTE, RAMP);
+    }
+
+    tile_config.teardown.exit(C_ROUTE);
+}
+
+fn bcast_configure() void {
+    const addr = color_config.get_color_config_addr(C_ROUTE);
+
+    if (last_px) {
+        if (last_py) {
+            color_config.reset_routes(addr, .{.tx = [2]direction{WEST, NORTH}, .rx = RAMP});
+        } else {
+            if (first_py) {
+                color_config.reset_routes(addr, .{.tx = [2]direction{WEST, RAMP}, .rx = SOUTH});
+            } else {
+                color_config.reset_routes(addr, .{.tx = [3]direction{WEST, RAMP, NORTH}, .rx = SOUTH});
+            }
+        }
+    } else {
+        if (first_px) {
+            color_config.reset_routes(addr, .{.tx = RAMP, .rx = EAST});
+        } else {
+            color_config.reset_routes(addr, .{.tx = [2]direction{WEST, RAMP}, .rx = EAST});
+        }
+    }
+
+    switch_config.clear_current_position(C_ROUTE);
+    switch_config.set_invalid_for_all_switch_positions(C_ROUTE);
+    tile_config.teardown.exit(C_ROUTE);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Comptime configuration
+////////////////////////////////////////////////////////////////////////////////
+
+comptime {
+    @set_teardown_handler(teardown_allreduce, C_ROUTE);
+}
+
+comptime {
+    const universalConfig = .{
+        .routes= .{
+            .rx = .{ WEST },
+            .tx = .{ EAST },
+        },
+        .switches=.{
+            .pos1 = .{ .rx = RAMP },
+            .ring_mode = true,
+            .pop_mode = .{ .pop_on_advance = true },
+        },
+        .teardown = true
+    };
+
+    if (1 == width) {
+        @comptime_assert(1 < width);
+    } else {
+        @set_local_color_config(C_ROUTE, universalConfig);
+    }
+}
+
+comptime {
+    @initialize_queue(iq_route, .{.color = C_ROUTE} );
+}
+
+comptime {
+    if (@is_arch("wse3")) {
+        @initialize_queue(oq_route, .{.color = C_ROUTE });
+    }
+}

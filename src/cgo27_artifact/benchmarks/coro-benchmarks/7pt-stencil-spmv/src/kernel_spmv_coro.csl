@@ -1,0 +1,168 @@
+// 7-point stencil SpMV kernel using coroutines.
+//
+// Both the allreduce and stencil modules expose async functions composed
+// via @await. No explicit task IDs are needed for either module — all
+// task allocation is handled by the coroutine worker pool.
+
+param memcpyParams;
+param reduceParams;
+param stencilParams;
+
+param MAX_ZDIM: i16; // size of vector x
+param BLOCK_SIZE: i16; // size of temporary buffers for communication
+
+const STATE: local_task_id = @claim_local_task();
+
+const timestamp = @import_module("<time>");
+
+// memcpy module reserves input/output queue 0 and 1
+const sys_mod = @import_module( "<memcpy/memcpy>", memcpyParams);
+
+// allreduce uses input queue/output queue 2
+const reduce_mod = @import_module( "../../benchmark-libs/allreduce/pe.csl", .{
+     .first_px = reduceParams.first_px,
+     .last_px = reduceParams.last_px,
+     .first_py = reduceParams.first_py,
+     .last_py = reduceParams.last_py,
+     .C_ROUTE = reduceParams.C_ROUTE,
+     .width = reduceParams.width,
+     .height = reduceParams.height,
+     .queues = [1]u16{2},
+     .dest_dsr_ids = [1]u16{1},
+     .src0_dsr_ids = [1]u16{1},
+     .src1_dsr_ids = [1]u16{1}
+     });
+
+// output queue cannot overlap input queues
+const stencil_mod = @import_module( "../../benchmark-libs/stencil_3d_7pts/pe.csl", .{
+     .c_recv_west = stencilParams.c_recv_west,
+     .c_send_east = stencilParams.c_send_east,
+     .c_recv_east = stencilParams.c_recv_east,
+     .c_send_west = stencilParams.c_send_west,
+     .c_recv_south = stencilParams.c_recv_south,
+     .c_send_north = stencilParams.c_send_north,
+     .c_recv_north = stencilParams.c_recv_north,
+     .c_send_south = stencilParams.c_send_south,
+     .first_px = stencilParams.first_px,
+     .last_px = stencilParams.last_px,
+     .first_py = stencilParams.first_py,
+     .last_py = stencilParams.last_py,
+     .impl = "hybrid",
+     .input_queues = [4]u16{4, 5, 6, 7},
+     .output_queues = if (@is_arch("wse3")) [4]u16{4, 5, 6, 7} else [1]u16{3},
+     .output_ut_id = 3,
+     .BLOCK_SIZE = BLOCK_SIZE,
+     .dest_dsr_ids = [2]u16{2,3},
+     .src0_dsr_ids = [1]u16{2},
+     .src1_dsr_ids = [2]u16{2,3}
+     });
+
+
+// tsc_size_words = 3
+var tscStartBuffer = @zeros([timestamp.tsc_size_words]u16);
+var tscEndBuffer = @zeros([timestamp.tsc_size_words]u16);
+
+var x = @zeros([MAX_ZDIM]f32);
+var y = @zeros([MAX_ZDIM]f32);
+
+// stencil coefficients: {c_west, c_east, c_south, c_north, c_bottom, c_top, c_center}
+var stencil_coeff = @zeros([7]f32);
+
+var time_buf_u16 = @zeros([timestamp.tsc_size_words*2]u16);
+var time_ref_u16 = @zeros([timestamp.tsc_size_words]u16);
+
+var ptr_x: [*]f32 = &x;
+var ptr_y: [*]f32 = &y;
+var ptr_stencil_coeff: [*]f32 = &stencil_coeff;
+var ptr_time_buf_u16: [*]u16 = &time_buf_u16;
+var ptr_time_ref: [*]u16 = &time_ref_u16;
+
+// Args from RPC entry to async task. Must be globals because the entry
+// function returns before the task body runs.
+var n_arg: i16 = 0;
+var do_sync: bool = false;
+
+fn f_enable_timer() void {
+    timestamp.enable_tsc();
+    sys_mod.unblock_cmd_stream();
+}
+
+fn f_tic() void {
+    timestamp.get_timestamp(&tscStartBuffer);
+    sys_mod.unblock_cmd_stream();
+}
+
+fn f_toc() void {
+    timestamp.get_timestamp(&tscEndBuffer);
+    sys_mod.unblock_cmd_stream();
+}
+
+fn f_memcpy_timestamps() void {
+    time_buf_u16[0] = tscStartBuffer[0];
+    time_buf_u16[1] = tscStartBuffer[1];
+    time_buf_u16[2] = tscStartBuffer[2];
+    time_buf_u16[3] = tscEndBuffer[0];
+    time_buf_u16[4] = tscEndBuffer[1];
+    time_buf_u16[5] = tscEndBuffer[2];
+    sys_mod.unblock_cmd_stream();
+}
+
+fn f_sync(n: i16) void {
+    n_arg = n;
+    do_sync = true;
+    @activate(STATE);
+}
+
+fn f_spmv(n: i16) void {
+    n_arg = n;
+    do_sync = false;
+    @activate(STATE);
+}
+
+async task f_state() void {
+    if (do_sync) {
+        var dot: f32 = 0.0;
+        @await(reduce_mod.async_allreduce(n_arg, @ptrcast([*]f32, &dot), reduce_mod.TYPE_BINARY_OP.ADD));
+    } else {
+        timestamp.get_timestamp(&tscStartBuffer);
+        @await(stencil_mod.async_spmv(n_arg, &stencil_coeff, &x, &y));
+    }
+
+    timestamp.get_timestamp(&tscEndBuffer);
+    sys_mod.unblock_cmd_stream();
+}
+
+fn f_reference_timestamps() void {
+    time_ref_u16[0] = reduce_mod.tscRefBuffer[0];
+    time_ref_u16[1] = reduce_mod.tscRefBuffer[1];
+    time_ref_u16[2] = reduce_mod.tscRefBuffer[2];
+    sys_mod.unblock_cmd_stream();
+}
+
+comptime {
+    @bind_local_task(f_state, STATE);
+}
+
+fn f_init() void {
+    @coro_runtime_init();
+    sys_mod.unblock_cmd_stream();
+}
+
+comptime {
+    @export_symbol(ptr_x, "x");
+    @export_symbol(ptr_y, "y");
+    @export_symbol(ptr_stencil_coeff, "stencil_coeff");
+    @export_symbol(ptr_time_buf_u16, "time_buf_u16");
+    @export_symbol(ptr_time_ref, "time_ref");
+}
+
+comptime {
+    @export_symbol(f_enable_timer);
+    @export_symbol(f_tic);
+    @export_symbol(f_toc);
+    @export_symbol(f_memcpy_timestamps);
+    @export_symbol(f_init);
+    @export_symbol(f_sync);
+    @export_symbol(f_spmv);
+    @export_symbol(f_reference_timestamps);
+}

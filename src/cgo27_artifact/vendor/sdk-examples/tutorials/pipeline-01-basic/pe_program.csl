@@ -1,0 +1,62 @@
+// Copyright 2025 Cerebras Systems.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+param memcpy_params;
+
+// number of elements received from host
+param size: i16;
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+
+// Queues
+const h2d_1_iq: input_queue = @get_input_queue(2);
+const d2h_1_oq: output_queue = @get_output_queue(3);
+
+// Task IDs
+const main_task_id: local_task_id = @get_local_task_id(8);
+
+const in_dsd = @get_dsd(fabin_dsd, .{
+  .extent = size,
+  .input_queue = h2d_1_iq
+});
+
+const out_dsd = sys_mod.get_streaming_fabout_dsd(@get_color(@bitcast(u16, sys_mod.MEMCPYD2H_1)), size, d2h_1_oq);
+
+var buf = @zeros([1]i16);
+const one_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{size} -> buf[0] });
+
+task main_task() void {
+  // WARNING: large size can stall.
+  // H2D and D2H are serialized. It is NOT safe to run "send" and "recv"
+  // involving memcpy at the same time on the same PE.
+  //
+  // It only works for a small vector because the HW has some internal
+  // queues to hold those values from/to IO. If such queues are full,
+  // I/O stalls.
+  //
+  // In this case, if the length exceeds certain amount,
+  // H2D cannot finish and D2H has no chance to run.
+
+  buf[0] = @as(i16, 1);
+  @add16(out_dsd, in_dsd, one_dsd, .{ .async = true });
+}
+
+comptime {
+  // activate local task main_task at startup
+  @activate(main_task_id);
+  @bind_local_task(main_task, main_task_id);
+
+  @initialize_queue(h2d_1_iq,  .{ .color = @get_color(@bitcast(u16, sys_mod.MEMCPYH2D_1)) });
+  @initialize_queue(d2h_1_oq, if (@is_arch("wse3")) .{ .color = @get_color(@bitcast(u16, sys_mod.MEMCPYD2H_1)) } else .{});
+}

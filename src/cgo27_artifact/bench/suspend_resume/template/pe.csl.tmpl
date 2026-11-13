@@ -1,0 +1,123 @@
+// AUTO-GENERATED FROM pe.csl.tmpl — do not edit by hand.
+// Suspend/resume latency microbenchmark.
+//   await-chain depth D=$DEPTH, suspends per function K=$K.
+//
+// Pattern (depth D):
+//   f_main → level_{D-1} → ... → level_1 → leaf      (D=1: f_main → leaf)
+//
+// Every function on the chain has K state-machine arms:
+//   - leaf has K-1 self-activated "dummy" suspends FOLLOWED by 1 timed suspend.
+//   - each level_k has K-1 self-activated dummy suspends FOLLOWED by 1 @await.
+// Dummies sit BEFORE the await/timed-suspend so that on resume each level
+// dispatches to its deepest switch arm (worst-case compare-chain cost).
+//
+// Self-activation: each dummy does `@activate(@current_task()); suspend;`.
+// The scheduler immediately re-queues us; the compiler can't fold this away
+// because @activate is a HW op with opaque semantics.
+//
+// `acc` (per function) is read from / written back to an exported sink global,
+// and each state writes a unique constant into it — this prevents cslc from
+// merging adjacent states.
+//
+// The timed suspend (only in leaf) activates WITNESS instead of self. The
+// witness samples M1, then activates resume_tid (= leaf's @current_task() =
+// STATE).
+//
+// The three markers are hardware timestamp-counter samples, not prints: the
+// cycle-annotated simprint log only exists under the simulator, and these
+// numbers have to be comparable against the same program on a real wafer.
+// Everything is on one PE and therefore one clock -- no reference-clock
+// correction is needed, unlike the multi-PE end2end benchmarks.
+//
+// A marker is ONE config-register read into a scalar, not the SDK's
+// `<time>.get_timestamp()`. That helper delivers the full 48-bit counter as
+// three reads plus three array stores and costs 10 cycles; a single-word read
+// costs 2. Since the counter is zeroed at enable_tsc() and the longest
+// interval in the whole sweep is under 400 cycles, the low 16 bits are all
+// that is needed, and the instrumentation that lands inside the measured
+// interval shrinks five-fold. What remains is subtracted using the null
+// configuration in null_pe.csl -- see its header.
+//
+// Chain levels and leaf are `noinline` so the stackless backend really emits
+// one switch-trampoline traversal per level on resume.
+
+param memcpy_params;
+
+const STATE:   local_task_id = @claim_local_task();
+const WITNESS: local_task_id = @claim_local_task();
+
+const sys_mod   = @import_module("<memcpy/memcpy>", memcpy_params);
+const timestamp = @import_module("<time>");
+const tile_cfg  = @import_module("<tile_config>");
+
+// Word address of the timestamp counter's low half. Folded at compile time,
+// so a marker really is a single @get_config.
+const TSC_BASE: u16 =
+    @get_int(tile_cfg.addresses.TIMESTAMP_COUNTER) / tile_cfg.word_size;
+
+// M0 = leaf just before the timed suspend, M1 = witness, M2 = leaf resumed.
+var mark0: u16 = 0;
+var mark1: u16 = 0;
+var mark2: u16 = 0;
+
+// Host-visible landing buffer, filled by f_read_timestamps after the run.
+var time_buf_u16 = @zeros([3]u16);
+var ptr_time_buf_u16: [*]u16 = &time_buf_u16;
+
+// Captured once by leaf; reused by witness to schedule the resume.
+var resume_tid: local_task_id;
+
+// Per-function exported sinks: each function reads its own at entry and
+// writes back at exit, forcing every per-state acc update to be observable.
+$SINK_DECLS
+
+// ===== Leaf: K-1 self-activated dummies, then 1 timed suspend =====
+noinline async fn leaf() void {
+    resume_tid = @current_task();
+    var acc: u16 = sink_leaf;
+
+$LEAF_BODY
+
+    sink_leaf = acc;
+}
+
+// ===== Chain levels: K-1 self-activated dummies, then 1 await =====
+$LEVELS
+
+// ===== Witness: ran by scheduler between the timed suspend and resume =====
+task witness() void {
+    mark1 = @get_config(TSC_BASE);
+    @activate(resume_tid);
+}
+
+// ===== Top-level driver =====
+async task f_main() void {
+    @await($TOP_CALL);
+    sys_mod.unblock_cmd_stream();
+}
+
+fn f_start() void {
+    timestamp.enable_tsc();
+    @coro_runtime_init();
+    @activate(STATE);
+}
+
+// Staged into one contiguous buffer so the host reads all three markers back
+// in a single d2h.
+fn f_read_timestamps() void {
+    time_buf_u16[0] = mark0;
+    time_buf_u16[1] = mark1;
+    time_buf_u16[2] = mark2;
+    sys_mod.unblock_cmd_stream();
+}
+
+comptime {
+    @bind_local_task(f_main, STATE);
+    @bind_local_task(witness, WITNESS);
+}
+
+comptime {
+    @export_symbol(ptr_time_buf_u16, "time_buf_u16");
+    @export_symbol(f_start);
+    @export_symbol(f_read_timestamps);
+}

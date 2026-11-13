@@ -1,0 +1,114 @@
+// Stencil 3D 7-point module (coroutine version).
+//
+// Provides async_spmv() for use with @await:
+//   @await(stencil_mod.async_spmv(n, coeff, x, y));
+//
+// This wrapper imports the architecture-specific implementation (WSE2/WSE3)
+// and re-exports async_spmv.
+//
+// Two backends are available, selected by the `impl` param:
+//
+//   "fiber"  (default) — fully async: async_spmv internally uses
+//                        @await_parallel(async_send(), async_recv()) on
+//                        fiber workers. No explicit local_task_id claims
+//                        from the stencil itself; the coroutine runtime
+//                        manages the worker pool. Higher per-spmv overhead
+//                        (~one worker_entry per direction switch) but no
+//                        extra task-table slots burned at comptime.
+//
+//   "hybrid"           — keeps the original callback-style state machine
+//                        (f_send/f_recv/f_comm tasks driven by @activate)
+//                        and wraps it in a thin async fn that suspends
+//                        exactly once per spmv. Pays one worker_entry per
+//                        spmv instead of one per direction switch, at the
+//                        cost of three extra @claim_local_task() slots.
+
+param c_recv_west: color;
+param c_send_east: color;
+param c_recv_east: color;
+param c_send_west: color;
+
+param c_recv_south: color;
+param c_send_north: color;
+param c_recv_north: color;
+param c_send_south: color;
+
+param first_px: bool;
+param last_px: bool;
+param first_py: bool;
+param last_py: bool;
+
+param input_queues:[4]u16;
+// WSE2:
+//   param output_queues:[1]u16;
+// WSE3:
+//   param output_queues:[4]u16;
+param output_queues = {};
+
+// only WSE3 needs output_ut_id
+param output_ut_id = {};
+
+param BLOCK_SIZE: i16; // size of temporary buffers for communication
+
+// explicit DSR allocation
+param dest_dsr_ids:[2]u16;
+param src0_dsr_ids:[1]u16;
+param src1_dsr_ids:[2]u16;
+
+
+// Backend selection. See the header for tradeoffs between the two.
+//   "fiber"  — fully async; default.
+//   "hybrid" — state-machine internals, one suspend per spmv.
+param impl: comptime_string = "fiber";
+
+// The user must specify --import-path=<path to benchmark-libs>
+fn get_stencil_module() comptime_string {
+  @comptime_assert(impl == "fiber" or impl == "hybrid",
+                   "stencil_3d_7pts: impl must be \"fiber\" or \"hybrid\"");
+
+  if (impl == "hybrid") {
+    if (@is_arch("wse3")) {
+      return "../../benchmark-libs/stencil_3d_7pts/wse3/pe_hybrid.csl";
+    } else {
+      return "../../benchmark-libs/stencil_3d_7pts/wse2/pe_hybrid.csl";
+    }
+  } else {
+    if (@is_arch("wse3")) {
+      return "../../benchmark-libs/stencil_3d_7pts/wse3/pe.csl";
+    } else {
+      return "../../benchmark-libs/stencil_3d_7pts/wse2/pe.csl";
+    }
+  }
+}
+
+const stencilParams = .{
+  .c_recv_west = c_recv_west,
+  .c_send_east = c_send_east,
+  .c_recv_east = c_recv_east,
+  .c_send_west = c_send_west,
+
+  .c_recv_south = c_recv_south,
+  .c_send_north = c_send_north,
+  .c_recv_north = c_recv_north,
+  .c_send_south = c_send_south,
+
+  .first_px = first_px,
+  .last_px = last_px,
+  .first_py = first_py,
+  .last_py = last_py,
+
+  .input_queues = input_queues,
+  .output_queues = output_queues,
+  .output_ut_id = output_ut_id,
+
+  .BLOCK_SIZE = BLOCK_SIZE,
+
+  .dest_dsr_ids = dest_dsr_ids,
+  .src0_dsr_ids = src0_dsr_ids,
+  .src1_dsr_ids = src1_dsr_ids
+};
+
+const stencil_mod = @import_module(get_stencil_module(), stencilParams);
+
+// Coroutine version: expose async_spmv for use with @await.
+const async_spmv = stencil_mod.async_spmv;

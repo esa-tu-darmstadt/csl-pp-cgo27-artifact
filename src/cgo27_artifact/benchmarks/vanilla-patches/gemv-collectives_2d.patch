@@ -1,0 +1,319 @@
+diff -ruN -x 'out-*' -x 'cslc-*.log' ga/gemv-collectives_2d/layout.csl gb/gemv-collectives_2d/layout.csl
+--- ga/gemv-collectives_2d/layout.csl	2026-11-13 09:40:57.845480468 +0000
++++ gb/gemv-collectives_2d/layout.csl	2026-11-13 09:40:57.858480450 +0000
+@@ -36,10 +36,7 @@
+ param matrix_cols : u16; // Width of matrix
+ 
+ comptime {
+-  // Number of matrix rows must be multiple of kernel rectangle height
+   @comptime_assert(matrix_rows % kernel_rows == 0);
+-
+-  // Number of matrix cols must be multiple of kernel rectangle width
+   @comptime_assert(matrix_cols % kernel_cols == 0);
+ }
+ 
+@@ -82,5 +79,10 @@
+   @export_name("x", [*]f32, true);
+   @export_name("b", [*]f32, true);
+   @export_name("y", [*]f32, true);
+-  @export_name("main", fn()void);
++  @export_name("time_buf_u16", [*]u16, true);
++  @export_name("f_enable_timer",      fn()void);
++  @export_name("f_tic",               fn()void);
++  @export_name("f_toc",               fn()void);
++  @export_name("f_memcpy_timestamps", fn()void);
++  @export_name("main",                fn()void);
+ }
+diff -ruN -x 'out-*' -x 'cslc-*.log' ga/gemv-collectives_2d/pe.csl gb/gemv-collectives_2d/pe.csl
+--- ga/gemv-collectives_2d/pe.csl	2026-11-13 09:40:57.846480467 +0000
++++ gb/gemv-collectives_2d/pe.csl	2026-11-13 09:40:57.859480448 +0000
+@@ -12,6 +12,12 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
++// y = Ax + b kernel (non-coroutine SDK version).
++//
++// Mirrors the SDK benchmark at examples/benchmarks/gemv-collectives_2d/pe.csl
++// but adds per-PE start/end timestamps so cycle counts can be compared against
++// the coroutine version.
++
+ param memcpy_params;
+ param c2d_params;
+ 
+@@ -27,56 +33,80 @@
+ const gather_result_task_id:    local_task_id = @get_local_task_id(13);
+ 
+ const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
++const timestamp = @import_module("<time>");
+ 
+-// The default values of queue IDs and DSR IDs of collectives_2d are applied implicitly.
+-// See mpi_x and mpi_y of gemm-collectives_2d/pe.csl for default values of queue and DSR IDs.
+ const mpi_x = @import_module("<collectives_2d/pe>", .{ .dim_params = c2d_params.x });
+ const mpi_y = @import_module("<collectives_2d/pe>", .{ .dim_params = c2d_params.y });
+ 
+-// Size of rectangle of PEs on which our kernel runs
+ const Pw = @get_rectangle().width;  // Num cols of PEs in kernel
+ const Ph = @get_rectangle().height; // Num rows of PEs in kernel
+ 
+-// Only PE (0,0) will be initialized by run.py with a full copy of `x`
++// Only PE (0,0) will be initialized by run.py with a full copy of `x`.
+ var x_src = @zeros([Nt * Pw]f32);
+ var ptr_x : [*]f32 = &x_src;
+ 
+-// Only PE (0,0) will be initialized by run.py with a full copy of `b`
++// Only PE (0,0) will be initialized by run.py with a full copy of `b`.
+ var b_src = @zeros([Mt * Ph]f32);
+ var ptr_b : [*]f32 = &b_src;
+ 
+-// Each PE has its own tile of `A` initialized by run.py
++// Each PE has its own tile of `A` initialized by run.py.
+ var A_tile = @zeros([Mt*Nt]f32);
+ const dsd_A_tile = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Mt} -> A_tile[i*@as(i16, Nt)] });
+ var ptr_A : [*]f32 = &A_tile;
+ 
+-// The tile of `x` which will be scattered across PEs received in `scatter_x()`
+-// or received in `broadcast_x_down()`
+ var x_tile = @zeros([Nt]f32);
+ const dsd_x_tile = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Nt} -> x_tile[i]});
+ 
+-// The tile of `b` which will be scattered across PEs received in `scatter_b()`
+ var b_tile = @zeros([Mt]f32);
+ const dsd_b_tile = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Mt} -> b_tile[i]});
+ 
+-// The product of `A_tile` with `x_tile` (computed by the `compute()` task)
+ var local_prod = @zeros([Mt]f32);
+ const dsd_local_prod = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Mt} -> local_prod[i]});
+ 
+-// The sum of products across a row of PEs
+ var row_sum = @zeros([Mt]f32);
+ 
+-// The final result is stored on PE (Pw-1, Ph-1)
++// The final result is stored on PE (Pw-1, Ph-1).
+ var final_result = @zeros([Mt * Ph]f32);
+ var ptr_y : [*]f32 = &final_result;
+ 
+-// Updated at runtime to store x and y IDs of PE reported by collectives library
+ var px: u16;
+ var py: u16;
+ 
+-// Entrypoint into kernel
+-// PE (0,0) scatters `b` into tiles across the left column of PEs
++// Cycle-count timing buffers.
++var tscStartBuffer = @zeros([timestamp.tsc_size_words]u16);
++var tscEndBuffer   = @zeros([timestamp.tsc_size_words]u16);
++var time_buf_u16   = @zeros([timestamp.tsc_size_words*2]u16);
++var ptr_time_buf_u16: [*]u16 = &time_buf_u16;
++
++fn f_enable_timer() void {
++    timestamp.enable_tsc();
++    sys_mod.unblock_cmd_stream();
++}
++
++fn f_tic() void {
++    timestamp.get_timestamp(&tscStartBuffer);
++    sys_mod.unblock_cmd_stream();
++}
++
++fn f_toc() void {
++    timestamp.get_timestamp(&tscEndBuffer);
++    sys_mod.unblock_cmd_stream();
++}
++
++fn f_memcpy_timestamps() void {
++    time_buf_u16[0] = tscStartBuffer[0];
++    time_buf_u16[1] = tscStartBuffer[1];
++    time_buf_u16[2] = tscStartBuffer[2];
++    time_buf_u16[3] = tscEndBuffer[0];
++    time_buf_u16[4] = tscEndBuffer[1];
++    time_buf_u16[5] = tscEndBuffer[2];
++    sys_mod.unblock_cmd_stream();
++}
++
++// Entrypoint into kernel.
++// PE (0,0) scatters `b` into tiles across the left column of PEs.
+ fn main() void {
++  timestamp.get_timestamp(&tscStartBuffer);
+   mpi_x.init();
+   mpi_y.init();
+   px = mpi_x.pe_id;
+@@ -90,7 +120,6 @@
+   }
+ }
+ 
+-// Scatter `x` into tiles across the top row of PEs
+ task scatter_x() void {
+   if (py == 0) {
+     mpi_x.scatter(0, @ptrcast([*]u32, &x_src), @ptrcast([*]u32, &x_tile),
+@@ -100,17 +129,13 @@
+   }
+ }
+ 
+-// Broadcast tiles of `x` down the columns of PEs
+ task broadcast_x_down() void {
+   mpi_y.broadcast(0, @ptrcast([*]u32, &x_tile), Nt, compute_task_id);
+ }
+ 
+-// Compute the product of the local `x_tile` with the local `A_tile`,
+-// then reduce it across rows of PEs
+ task compute() void {
+ 
+   for (@range(i16, Nt)) |j| {
+-    // offset dsd_A_tile to the corresponding column of A_tile
+     const dsd_A_offset = @increment_dsd_offset(dsd_A_tile, j, f32);
+     @fmacs(dsd_local_prod, dsd_local_prod, dsd_A_offset, x_tile[j]);
+   }
+@@ -123,13 +148,13 @@
+                      Mt, gather_result_task_id);
+ }
+ 
+-// Gather the product into the bottom right PE
+ task gather_result() void {
+   mpi_y.gather(Ph - 1, @ptrcast([*]u32, &row_sum), @ptrcast([*]u32, &final_result),
+                Mt, EXIT);
+ }
+ 
+ task f_exit() void {
++  timestamp.get_timestamp(&tscEndBuffer);
+   sys_mod.unblock_cmd_stream();
+ }
+ 
+@@ -144,5 +169,10 @@
+   @export_symbol(ptr_x, "x");
+   @export_symbol(ptr_b, "b");
+   @export_symbol(ptr_y, "y");
++  @export_symbol(ptr_time_buf_u16, "time_buf_u16");
++  @export_symbol(f_enable_timer);
++  @export_symbol(f_tic);
++  @export_symbol(f_toc);
++  @export_symbol(f_memcpy_timestamps);
+   @export_symbol(main);
+ }
+diff -ruN -x 'out-*' -x 'cslc-*.log' ga/gemv-collectives_2d/run.py gb/gemv-collectives_2d/run.py
+--- ga/gemv-collectives_2d/run.py	2026-11-13 09:40:57.846480467 +0000
++++ gb/gemv-collectives_2d/run.py	2026-11-13 09:40:57.859480448 +0000
+@@ -38,7 +38,6 @@
+ matrix_rows = int(compile_data['params']['matrix_rows'])
+ matrix_cols = int(compile_data['params']['matrix_cols'])
+ 
+-# Create tensors for A, X, B.
+ # Use a deterministic seed so that CI results are predictable
+ np.random.seed(seed=7)
+ 
+@@ -46,10 +45,8 @@
+ X = np.random.rand(matrix_cols).astype(np.float32)
+ B = np.random.rand(matrix_rows).astype(np.float32)
+ 
+-# Compute expected result
+ y_expected = (A @ X) + B
+ 
+-# Specify path to ELF files, set up runner
+ runner = SdkRuntime(args.name, cmaddr=args.cmaddr)
+ 
+ memcpy_dtype = MemcpyDataType.MEMCPY_32BIT
+@@ -59,74 +56,68 @@
+ symbol_x = runner.get_id("x")
+ symbol_b = runner.get_id("b")
+ symbol_y = runner.get_id("y")
++symbol_time_buf_u16 = runner.get_id("time_buf_u16")
+ 
+ runner.load()
+ runner.run()
+ 
+ print("Copying data...")
+-# Compute number of rows and cols of A on each PE
+ per_pe_rows = matrix_rows // kernel_rows
+ per_pe_cols = matrix_cols // kernel_cols
+ 
+-# This transformation on A creates a flattened array so that the matrix can
+-# be mapped onto the PEs using MemcpyOrder.ROW_MAJOR copy ordering.
+-# The arrays holding A on each PE are 1D arrays that store the submatrices
+-# in row major order.
+-
+-# As an example, consider A[4, 4], mapped onto a 2x2 grid of PEs:
+-#
+-#   Matrix A on host            2 x 2 PE grid, row major A submatrices
+-# +----+----+----+----+         +----------------+----------------+
+-# | 0  | 1  | 2  | 3  |         | PE (0, 0):     | PE (1, 0):     |
+-# +----+----+----+----+         |  0,  1,  4,  5 |  2,  3,  6,  7 |
+-# | 4  | 5  | 6  | 7  |         |                |                |
+-# +----+----+----+----+   --->  +----------------+----------------+
+-# | 8  | 9  | 10 | 11 |         | PE (0, 1):     | PE (1, 1):     |
+-# +----+----+----+----+         |  8,  9, 12, 13 | 10, 11, 14, 15 |
+-# | 12 | 13 | 14 | 15 |         |                |                |
+-# +----+----+----+----+         +----------------+----------------+
+-#
+-# MemcpyOrder.ROW_MAJOR copy ordering maps an input array to dimensions h x w x l,
+-# with l varying fastest, where:
+-#   - h is kernel_rows (i.e., height of program rectangle)
+-#   - w is kernel_cols (i.e., width of program rectangle)
+-#   - l is per_pe_rows * per_pe_cols (i.e., num elems copied to each PE)
+-#
+-# So our input array for memcpy_h2d must be ordered as follows:
+-# [ 0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15 ]
+-
+-# The transformation here takes the matrix A and:
+-#   1. splits A into kernel_cols submatrices, along the vertical axis
+-#   2. stacks them into a 3D array, with kernel_col as 0th dimension
+-#   3. splits 3D array into kernel_rows subarrays, along the horizontal axis
+-#   4. stacks them into a 4D array, with kernel_row as 0th dimension
+-#   5. flattens into a 1D array
+ data = np.stack(np.split(np.stack(np.split(A, kernel_cols, axis=1)), kernel_rows, axis=1)).ravel()
+ 
+-# Copy flattened A array onto PEs
+ runner.memcpy_h2d(symbol_A, data, 0, 0, kernel_cols, kernel_rows, per_pe_rows * per_pe_cols,
+                   streaming=False, data_type=memcpy_dtype, nonblock=False,
+                   order=memcpy_order)
+ 
+-# Place x and b on PE (0,0). They will be scattered with collective comms
+ runner.memcpy_h2d(symbol_x, X, 0, 0, 1, 1, matrix_cols,
+                   streaming=False, data_type=memcpy_dtype, nonblock=False, order=memcpy_order)
+ runner.memcpy_h2d(symbol_b, B, 0, 0, 1, 1, matrix_rows,
+                   streaming=False, data_type=memcpy_dtype, nonblock=False, order=memcpy_order)
+ 
+ print("Launching kernel...")
+-# Run the kernel
++# Enable per-PE timestamp counter.
++runner.launch("f_enable_timer", nonblock=False)
++# Run the kernel.
+ runner.launch("main", nonblock=False)
++# Marshal (start, end) into the export-visible buffer.
++runner.launch("f_memcpy_timestamps", nonblock=False)
+ 
+-# Collect the result y from PE (kernel_cols-1,kernel_rows-1) and compare to expected
+ y = np.zeros(matrix_rows, dtype=np.float32)
+ runner.memcpy_d2h(y, symbol_y, kernel_cols-1, kernel_rows-1, 1, 1, matrix_rows,
+                   streaming=False, data_type=memcpy_dtype, nonblock=False,
+                   order=memcpy_order)
++
++# D2H the per-PE timestamps (6 u16 words: 3 start, 3 end).
++time_buf_1d = np.zeros(kernel_rows * kernel_cols * 6, np.uint32)
++runner.memcpy_d2h(time_buf_1d, symbol_time_buf_u16,
++                  0, 0, kernel_cols, kernel_rows, 6,
++                  streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
++                  order=memcpy_order, nonblock=False)
++
+ runner.stop()
+ print("Copied back result.")
+ 
+ print("y calculated: ", y)
+ print("y expected:   ", y_expected)
+ np.testing.assert_allclose(y, y_expected, atol=0.01, rtol=0)
++
++# Reconstruct u48 timestamps from the 3 u16 words and compute total cycles.
++def make_u48(words):
++  return int(words[0]) + (int(words[1]) << 16) + (int(words[2]) << 32)
++
++time_hwl = time_buf_1d.astype(np.uint16).reshape(kernel_rows, kernel_cols, 6)
++time_start = np.zeros((kernel_rows, kernel_cols), dtype=np.int64)
++time_end   = np.zeros((kernel_rows, kernel_cols), dtype=np.int64)
++for hi in range(kernel_rows):
++  for wi in range(kernel_cols):
++    time_start[hi, wi] = make_u48(time_hwl[hi, wi, 0:3])
++    time_end[hi, wi]   = make_u48(time_hwl[hi, wi, 3:6])
++
++cycles_send = int(time_end.max() - time_start.min())
++time_send_us = cycles_send / 850.0
++print(f"cycles_send = {cycles_send} cycles")
++print(f"time_send   = {time_send_us:.3f} us")
++
+ print("SUCCESS")

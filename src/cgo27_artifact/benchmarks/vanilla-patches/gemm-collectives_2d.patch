@@ -1,0 +1,253 @@
+diff -ruN -x 'out-*' -x 'cslc-*.log' ga/gemm-collectives_2d/layout.csl gb/gemm-collectives_2d/layout.csl
+--- ga/gemm-collectives_2d/layout.csl	2026-11-13 09:40:57.866480439 +0000
++++ gb/gemm-collectives_2d/layout.csl	2026-11-13 09:40:57.880480419 +0000
+@@ -66,5 +66,10 @@
+   @export_name("A", [*]f32, true);
+   @export_name("B", [*]f32, true);
+   @export_name("C", [*]f32, true);
+-  @export_name("main", fn()void);
++  @export_name("time_buf_u16", [*]u16, true);
++  @export_name("f_enable_timer",      fn()void);
++  @export_name("f_tic",               fn()void);
++  @export_name("f_toc",               fn()void);
++  @export_name("f_memcpy_timestamps", fn()void);
++  @export_name("main",                fn()void);
+ }
+diff -ruN -x 'out-*' -x 'cslc-*.log' ga/gemm-collectives_2d/pe.csl gb/gemm-collectives_2d/pe.csl
+--- ga/gemm-collectives_2d/pe.csl	2026-11-13 09:40:57.867480437 +0000
++++ gb/gemm-collectives_2d/pe.csl	2026-11-13 09:40:57.880480419 +0000
+@@ -12,16 +12,11 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
+-// This program implements the SUMMA matrix multiplication algorithm and is
+-// written as an example to show how to use the `collectives_2d` library.
+-
+-// We perform GEMM in `P` many steps on a grid of `P x P` processors.
+-// At each step `i`, PEs in the `i`th column broadcast their home tiles of `A`
+-// to other PEs in their row, and PEs in the `i`th row broadcast their home
+-// tiles of `B` to other PEs in their column. Once both broadcasts are complete
+-// as determined by `x_done()` and `y_done()` both being activated,
+-// each PE computes `C_tile += Ap * Bp` where `Ap` and `Bp` are pointers to
+-// either the PE's home tile or the tile it received through broadcasts.
++// SUMMA matrix multiplication kernel (non-coroutine SDK version).
++//
++// Mirrors the SDK benchmark at examples/benchmarks/gemm-collectives_2d/pe.csl
++// but adds per-PE start/end timestamps so cycle counts can be compared against
++// the coroutine version.
+ 
+ param c2d_params;
+ param memcpy_params;
+@@ -52,15 +47,11 @@
+     .src1_dsr_ids = [1]u16{2}
+     });
+ 
+-// On WSE-2, memcpy uses input/output queue 0
+-// On WSE-3, memcpy uses input/output queues 0 and 1
+ const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
++const timestamp = @import_module("<time>");
+ 
+ const P = @get_rectangle().width;
+ 
+-// This PE's home tile of A, B, C
+-// `A_tile` and `B_tile` will be populated with initial values by run.py
+-// These arrays are stored in a column major format.
+ var A_tile = @zeros([Mt*Kt]f32);
+ var B_tile = @zeros([Kt*Nt]f32);
+ var C_tile = @zeros([Mt*Nt]f32);
+@@ -69,13 +60,43 @@
+ var ptr_B : [*]f32 = &B_tile;
+ var ptr_C : [*]f32 = &C_tile;
+ 
+-// Temporary buffers for storing in-flight tiles of A and B
+ var A_buffer = @zeros([Mt*Kt]f32);
+ var B_buffer = @zeros([Kt*Nt]f32);
+ 
+ var px: u16;
+ var py: u16;
+ 
++// Cycle-count timing buffers.
++var tscStartBuffer = @zeros([timestamp.tsc_size_words]u16);
++var tscEndBuffer   = @zeros([timestamp.tsc_size_words]u16);
++var time_buf_u16   = @zeros([timestamp.tsc_size_words*2]u16);
++var ptr_time_buf_u16: [*]u16 = &time_buf_u16;
++
++fn f_enable_timer() void {
++    timestamp.enable_tsc();
++    sys_mod.unblock_cmd_stream();
++}
++
++fn f_tic() void {
++    timestamp.get_timestamp(&tscStartBuffer);
++    sys_mod.unblock_cmd_stream();
++}
++
++fn f_toc() void {
++    timestamp.get_timestamp(&tscEndBuffer);
++    sys_mod.unblock_cmd_stream();
++}
++
++fn f_memcpy_timestamps() void {
++    time_buf_u16[0] = tscStartBuffer[0];
++    time_buf_u16[1] = tscStartBuffer[1];
++    time_buf_u16[2] = tscStartBuffer[2];
++    time_buf_u16[3] = tscEndBuffer[0];
++    time_buf_u16[4] = tscEndBuffer[1];
++    time_buf_u16[5] = tscEndBuffer[2];
++    sys_mod.unblock_cmd_stream();
++}
++
+ task x_done() void {
+   @activate(compute_task_id);
+ }
+@@ -88,15 +109,16 @@
+ fn main() void {
+   @assert(step < P);
+ 
+-  // The first time through we need to initialize our state
++  // The first time through we need to initialize our state.
+   if (step == 0) {
++    timestamp.get_timestamp(&tscStartBuffer);
+     mpi_x.init();
+     mpi_y.init();
+     px = mpi_x.pe_id;
+     py = mpi_y.pe_id;
+   }
+ 
+-  // Communicate along both rows and columns
++  // Communicate along both rows and columns.
+   const Ap = if (px == step) &A_tile else &A_buffer;
+   const Bp = if (py == step) &B_tile else &B_buffer;
+   mpi_x.broadcast(step, @ptrcast([*]u32, Ap), Mt * Kt, x_task_id);
+@@ -107,7 +129,6 @@
+   const Ap = if (px == step) &A_tile else &A_buffer;
+   const Bp = if (py == step) &B_tile else &B_buffer;
+ 
+-  // Do an fmacs based local GEMM
+   var A_dsd  = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Mt} -> A_tile[i] });
+   A_dsd = @set_dsd_base_addr(A_dsd, Ap);
+ 
+@@ -133,7 +154,8 @@
+ }
+ 
+ task f_exit() void {
+-  // the user must unblock cmd color for every PE
++  timestamp.get_timestamp(&tscEndBuffer);
++  // The user must unblock cmd color for every PE.
+   sys_mod.unblock_cmd_stream();
+ }
+ 
+@@ -147,5 +169,10 @@
+   @export_symbol(ptr_A, "A");
+   @export_symbol(ptr_B, "B");
+   @export_symbol(ptr_C, "C");
++  @export_symbol(ptr_time_buf_u16, "time_buf_u16");
++  @export_symbol(f_enable_timer);
++  @export_symbol(f_tic);
++  @export_symbol(f_toc);
++  @export_symbol(f_memcpy_timestamps);
+   @export_symbol(main);
+ }
+diff -ruN -x 'out-*' -x 'cslc-*.log' ga/gemm-collectives_2d/run.py gb/gemm-collectives_2d/run.py
+--- ga/gemm-collectives_2d/run.py	2026-11-13 09:40:57.867480437 +0000
++++ gb/gemm-collectives_2d/run.py	2026-11-13 09:40:57.880480419 +0000
+@@ -58,41 +58,14 @@
+ sym_A = runner.get_id("A")
+ sym_B = runner.get_id("B")
+ sym_C = runner.get_id("C")
++sym_time_buf_u16 = runner.get_id("time_buf_u16")
+ 
+ runner.load()
+ runner.run()
+ 
+-w = P # number of columns PEs in the core rectangle
++w = P # number of column PEs in the core rectangle
+ h = P # number of row PEs in the core rectangle
+ 
+-# How to transform a 2-D tensor into a cliff distribution with
+-# column-major local tensor
+-#
+-# Example: w=2, h=2, A is 4-by-4 (lh-by-lw)
+-# A = |  0  1  2  3 |
+-#     |  4  5  6  7 |
+-#     |  8  9 10 11 |
+-#     | 12 13 14 15 |
+-# A1 = A.reshape(2,2,2,2) of the form (h,lh,w,lw)
+-# A1 = | | 0  1|  | 4  5| |
+-#      | | 2  3|, | 6  7| |
+-#      |                  |
+-#      | | 8  9|  |12 13| |
+-#      | |10 11|, |14 15| |
+-# A2 = A1.transpose(0, 2, 3, 1) of the form (h, w, lw, lh)
+-# so the local tensor lh-by-lw is col-major
+-# A2 = | | 0  4|  | 2  6| |
+-#      | | 1  5|, | 3  7| |
+-#      |                  |
+-#      | | 8 12|  |10 14| |
+-#      | | 9 13|, |11 15| |
+-# A3 = A2.reshape(2,2,4)
+-# A3 = |  0  4  1  5 |
+-#      |  2  6  3  7 |
+-#      |  8 12  9 13 |
+-#      | 10 14 11 15 |
+-# A3 is h-w-l
+-
+ A1 = A.reshape(h, Mt, w, Kt)
+ A2 = A1.transpose(0, 2, 3, 1)
+ A3 = A2.reshape(h, w, Mt*Kt)
+@@ -105,27 +78,48 @@
+ runner.memcpy_h2d(sym_B, B3.ravel(), 0, 0, w, h, Kt*Nt, \
+     streaming=False, data_type=memcpy_dtype, order=MemcpyOrder.ROW_MAJOR, nonblock=True)
+ 
++# Enable the per-PE timestamp counter.
++runner.launch("f_enable_timer", nonblock=False)
++# Run the actual GEMM.
+ runner.launch("main", nonblock=False)
++# Marshal (start, end) into the export-visible buffer.
++runner.launch("f_memcpy_timestamps", nonblock=False)
+ 
+ C3_1d_u32 = np.zeros(h*w*Mt*Nt, np.uint32)
+ runner.memcpy_d2h(C3_1d_u32, sym_C, 0, 0, w, h, Mt*Nt, \
+     streaming=False, data_type=memcpy_dtype, order=MemcpyOrder.ROW_MAJOR, nonblock=False)
+-# C3 is h-by-w-l or
+-# C3 is of the form (h, w, Nt, Mt) where local tensor Mt-by-Nt is column-major
+ C3 = C3_1d_u32.reshape((h, w, Nt, Mt))
+-# C2 is of the form (h, Mt, w, Nt)
+ C2 = C3.transpose(0, 3, 1, 2)
+-# C1 is of the form (M, N)
+ C1 = C2.reshape(M, N)
+-# C has the correct data type
+ C = C1.view(np.float32)
+ 
++# D2H the per-PE timestamps (6 u16 words: 3 start, 3 end).
++time_buf_1d = np.zeros(h * w * 6, np.uint32)
++runner.memcpy_d2h(time_buf_1d, sym_time_buf_u16, 0, 0, w, h, 6, \
++    streaming=False, data_type=MemcpyDataType.MEMCPY_16BIT,
++    order=MemcpyOrder.ROW_MAJOR, nonblock=False)
++
+ runner.stop()
+ 
+ # Check the result
+ C_expected = np.dot(A, B)
+-
+-# absolute(a - b) <= (atol + rtol * absolute(b))
+ np.testing.assert_allclose(C_expected, C, rtol=1e-05, atol=1e-06)
+ 
++# Reconstruct u48 timestamps from the 3 u16 words and compute total cycles.
++def make_u48(words):
++  return int(words[0]) + (int(words[1]) << 16) + (int(words[2]) << 32)
++
++time_hwl = time_buf_1d.astype(np.uint16).reshape(h, w, 6)
++time_start = np.zeros((h, w), dtype=np.int64)
++time_end   = np.zeros((h, w), dtype=np.int64)
++for hi in range(h):
++  for wi in range(w):
++    time_start[hi, wi] = make_u48(time_hwl[hi, wi, 0:3])
++    time_end[hi, wi]   = make_u48(time_hwl[hi, wi, 3:6])
++
++cycles_send = int(time_end.max() - time_start.min())
++time_send_us = cycles_send / 850.0
++print(f"cycles_send = {cycles_send} cycles")
++print(f"time_send   = {time_send_us:.3f} us")
++
+ print("SUCCESS")

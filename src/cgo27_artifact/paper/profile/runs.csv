@@ -1,0 +1,15 @@
+benchmark,arch,cycles_instrumented,tiles,events
+7pt-stencil-spmv,wse2,1734,43,189788
+7pt-stencil-spmv,wse3,1901,43,166720
+bicgstab,wse3,24954,43,593958
+bicgstab,wse2,26974,43,673092
+conjugate-gradient,wse3,12718,43,381843
+conjugate-gradient,wse2,13683,43,436208
+gemv-collectives_2d,wse2,3369,31,91643
+gemv-collectives_2d,wse3,3620,31,84654
+gemm-collectives_2d,wse2,50656,31,808310
+gemm-collectives_2d,wse3,56368,31,836128
+power-method,wse2,7841,43,291327
+power-method,wse3,6430,43,244276
+preconditioned-conjugate-gradient,wse2,16684,43,484976
+preconditioned-conjugate-gradient,wse3,15474,43,428259

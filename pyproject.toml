@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "csl-pp-cgo27-artifact"
+version = "1.0.0"
+description = "Artifact of the CGO 2027 paper \"Structured Coroutines for the Wafer-Scale Engine\""
+readme = "README.md"
+license = "Apache-2.0 WITH LLVM-exception"
+license-files = ["LICENSE.TXT", "NOTICE"]
+requires-python = ">=3.10"
+authors = [{ name = "Tim Noack" }, { name = "Andreas Koch" }]
+dependencies = [
+  # The compiler of the paper, with the libraries the benchmarks import.
+  "csl-pp==2.0.0",
+  "pyelftools>=0.31",
+  "numpy>=1.24",
+  "matplotlib>=3.7",
+  # Needed by the trace tool in vendor/simtracer.
+  "tqdm>=4.60",
+]
+
+[project.optional-dependencies]
+# The appliance SDK, with which `cgo27-ae hardware` reserves a CS-3. Its
+# packages are built for Python 3.11 only.
+hardware = ["cerebras-sdk==2.10.0"]
+
+[project.urls]
+Source = "https://github.com/esa-tu-darmstadt/csl-pp-cgo27-artifact"
+"csl++" = "https://github.com/esa-tu-darmstadt/csl-pp"
+
+[project.scripts]
+cgo27-ae = "cgo27_artifact.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cgo27_artifact"]

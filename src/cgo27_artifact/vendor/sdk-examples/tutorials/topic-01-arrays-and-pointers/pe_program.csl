@@ -1,0 +1,45 @@
+// Copyright 2025 Cerebras Systems.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Not a complete program; the top-level source file is layout.csl
+
+param memcpy_params;
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+
+var result: [1]i16;
+var result_ptr: [*]i16 = &result;
+
+fn increment_and_sum(data_ptr: *[3]i16, result_ptr: *i16) void {
+  // Write an updated value to each element of the array
+  (data_ptr.*)[0] += 1;
+  (data_ptr.*)[1] += 1;
+  (data_ptr.*)[2] += 1;
+
+  // Read all array values, sum them, and write the result
+  result_ptr.* = (data_ptr.*)[0] + (data_ptr.*)[1] + (data_ptr.*)[2];
+}
+
+fn f_run() void {
+  var data = [3]i16 { 1, 2, 3 };
+
+  increment_and_sum(&data, &result[0]);
+
+  sys_mod.unblock_cmd_stream();
+}
+
+comptime {
+  @export_symbol(result_ptr, "result");
+  @export_symbol(f_run);
+}

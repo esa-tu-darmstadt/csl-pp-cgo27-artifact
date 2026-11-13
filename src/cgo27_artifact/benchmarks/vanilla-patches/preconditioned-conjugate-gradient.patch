@@ -1,0 +1,19 @@
+diff -ruN ga/preconditioned-conjugate-gradient/src/kernel_pcg.csl gb/preconditioned-conjugate-gradient/src/kernel_pcg.csl
+--- ga/preconditioned-conjugate-gradient/src/kernel_pcg.csl	2026-04-20 21:32:26.000000000 +0000
++++ gb/preconditioned-conjugate-gradient/src/kernel_pcg.csl	2026-11-12 10:53:08.590100936 +0000
+@@ -176,6 +176,7 @@
+ }
+ 
+ fn f_pcg(size:i16, tol_val:f32, max_ite_val: i16) void {
++    timestamp.get_timestamp(&tscStartBuffer);
+     n = size;
+     tol = tol_val;
+     max_ite = max_ite_val;
+@@ -401,6 +402,7 @@
+         f_update_x_r_rho();
+ 
+     }else if (STATE_EXIT == cur_state){
++        timestamp.get_timestamp(&tscEndBuffer);
+         sys_mod.unblock_cmd_stream();
+     }else{
+         @assert(false); // Error: unknown state

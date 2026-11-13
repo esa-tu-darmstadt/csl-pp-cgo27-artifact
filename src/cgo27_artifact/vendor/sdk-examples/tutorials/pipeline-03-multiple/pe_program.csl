@@ -1,0 +1,55 @@
+// Copyright 2025 Cerebras Systems.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+param memcpy_params;
+
+param size: i16;
+
+param Cin: color;
+param Cout: color;
+
+// Queue IDs
+const Cin_iq: input_queue = @get_input_queue(2);
+const Cout_oq: output_queue = @get_output_queue(3);
+
+// Task IDs
+const main_task_id: local_task_id = @get_local_task_id(8);
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+
+const Cin_in_dsd = @get_dsd(fabin_dsd, .{
+  .extent = size,
+  .input_queue = Cin_iq,
+});
+
+const Cout_out_dsd = sys_mod.get_streaming_fabout_dsd(Cout, size, Cout_oq);
+
+const buf = [1]i16{ 1 };
+const one_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{size} -> buf[0] });
+
+task main_task() void {
+  @add16(Cout_out_dsd, Cin_in_dsd, one_dsd, .{ .async = true });
+}
+
+comptime {
+  // activate local task main_task at startup
+  @bind_local_task(main_task, main_task_id);
+  @activate(main_task_id);
+
+  @set_local_color_config(Cin, .{ .routes = .{ .rx = .{ WEST }, .tx = .{ RAMP }}});
+  @set_local_color_config(Cout, .{ .routes = .{ .rx = .{ RAMP }, .tx = .{ EAST }}});
+
+  @initialize_queue(Cin_iq, .{ .color = Cin });
+  @initialize_queue(Cout_oq, if (@is_arch("wse3")) .{ .color = Cout } else .{});
+}

@@ -1,0 +1,64 @@
+// Layout module for `collectives_2d` (coroutine version).
+//
+// The library claims its 4 data colors (2 per dimension) internally via
+// `@claim_color()`. No entrypoint task IDs are needed — the async API
+// implementation runs on the caller's task and uses `@current_task()`
+// for DSD-completion activation and teardown waiting.
+
+// 2 colors for the X dimension (used for broadcast/scatter/gather along rows,
+// and for the alternating-color reduce network along rows)
+const X_DATA_COLOR_0: color = @claim_color();
+const X_DATA_COLOR_1: color = @claim_color();
+
+// 2 colors for the Y dimension
+const Y_DATA_COLOR_0: color = @claim_color();
+const Y_DATA_COLOR_1: color = @claim_color();
+
+const DimParams = struct {
+    DATA_COLOR_0: color,
+    DATA_COLOR_1: color,
+    POS_DIR: direction,
+    NEG_DIR: direction,
+    pe_min: bool,
+    pe_max: bool,
+    NUM_PES: u16,
+    DIM_ID: u16,
+};
+
+const Params = struct {
+    x: DimParams,
+    y: DimParams,
+};
+
+fn get_params(Px: u16, Py: u16) Params {
+
+    const width = @get_rectangle().width;
+    const height = @get_rectangle().height;
+
+    const x_dim_info = DimParams {
+        .DATA_COLOR_0 = X_DATA_COLOR_0,
+        .DATA_COLOR_1 = X_DATA_COLOR_1,
+        .POS_DIR = EAST,
+        .NEG_DIR = WEST,
+        .pe_min = (Px == 0),
+        .pe_max = (Px == (width - 1)),
+        .NUM_PES = width,
+        .DIM_ID = @as(u16, 0),
+    };
+
+    const y_dim_info = DimParams {
+        .DATA_COLOR_0 = Y_DATA_COLOR_0,
+        .DATA_COLOR_1 = Y_DATA_COLOR_1,
+        .POS_DIR = SOUTH,
+        .NEG_DIR = NORTH,
+        .pe_min = (Py == 0),
+        .pe_max = (Py == (height - 1)),
+        .NUM_PES = height,
+        .DIM_ID = @as(u16, 1),
+    };
+
+    return Params {
+        .x = x_dim_info,
+        .y = y_dim_info,
+    };
+}

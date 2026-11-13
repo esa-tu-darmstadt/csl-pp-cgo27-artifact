@@ -1,0 +1,19 @@
+diff -ruN ga/power-method/src/kernel_power.csl gb/power-method/src/kernel_power.csl
+--- ga/power-method/src/kernel_power.csl	2026-04-20 21:32:26.000000000 +0000
++++ gb/power-method/src/kernel_power.csl	2026-11-12 10:53:08.566100968 +0000
+@@ -153,6 +153,7 @@
+ }
+ 
+ fn f_power(size:i16, max_ite_val: i16) void {
++    timestamp.get_timestamp(&tscStartBuffer);
+     n = size;
+     max_ite = max_ite_val;
+ 
+@@ -244,6 +245,7 @@
+         f_scale_x_by_nrm2();
+ 
+     }else if (STATE_EXIT == cur_state){
++        timestamp.get_timestamp(&tscEndBuffer);
+         sys_mod.unblock_cmd_stream();
+     }else{
+         @assert(false); // Error: unknown state

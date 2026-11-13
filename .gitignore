@@ -1,0 +1,8 @@
+cgo27-ae-output/
+__pycache__/
+*.egg-info/
+build/
+dist/
+# Written by the appliance client during hardware runs.
+run_meta.json
+*-cluster-details.json

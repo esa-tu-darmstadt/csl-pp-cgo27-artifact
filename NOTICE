@@ -1,0 +1,23 @@
+csl-pp-cgo27-artifact
+
+This artifact contains third-party code:
+
+- src/cgo27_artifact/vendor/sdk-examples: the examples of the Cerebras SDK,
+  github.com/Cerebras/sdk-examples at tag v2.10.0, unmodified. Copyright
+  Cerebras Systems, Apache License, Version 2.0 (vendor/sdk-examples/LICENSE).
+
+- src/cgo27_artifact/benchmarks/vanilla-patches: changes to seven of those
+  examples, which add timestamps around the measured interval. They are
+  applied to a copy at run time.
+
+- src/cgo27_artifact/benchmarks/coro-benchmarks: the same seven benchmarks and
+  the libraries they use (benchmark-libs), written with the language
+  extensions of csl++. They are derived from the examples above and from the
+  libraries of the Cerebras SDK.
+
+- src/cgo27_artifact/vendor/simtracer: the trace tool
+  github.com/esa-tu-darmstadt/cerebras-simtracer at the commit in
+  vendor/simtracer/COMMIT, MIT License (vendor/simtracer/LICENSE).
+
+Everything else is under the Apache License v2.0 with LLVM Exceptions
+(LICENSE.TXT).

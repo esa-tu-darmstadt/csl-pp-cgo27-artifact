@@ -1,0 +1,83 @@
+// Null configuration: the measurement harness with nothing to measure.
+//
+// This is the same three-marker structure as pe.csl -- same markers, same
+// witness task, same activation chain -- but `producer` ends by plain task
+// return instead of by suspending a coroutine, and there is no coroutine
+// anywhere in the program. So
+//
+//   M1 - M0 = marker plumbing + task exit + dispatch + witness prologue
+//   M2 - M1 = marker plumbing + @activate + witness exit + dispatch + prologue
+//
+// which is exactly what the benchmark's own suspend/resume legs carry on top
+// of the thing being measured. plot.py subtracts these two constants from
+// every row, so what it reports is the cost of the suspend and of the resume
+// and not the cost of observing them. Without the subtraction the stackless
+// suspend on WSE-3 reads as 14 cycles when 12 of those are the rig.
+//
+// The constants are small (single-digit cycles) but so is a stackless
+// suspend, so they are not negligible: they are measured per (arch, target)
+// rather than assumed, because there is no reason for the dispatch cost to be
+// the same on a simulator and on silicon.
+
+param memcpy_params;
+
+const PRODUCER: local_task_id = @claim_local_task();
+const WITNESS:  local_task_id = @claim_local_task();
+const CONSUMER: local_task_id = @claim_local_task();
+
+const sys_mod   = @import_module("<memcpy/memcpy>", memcpy_params);
+const timestamp = @import_module("<time>");
+const tile_cfg  = @import_module("<tile_config>");
+
+const TSC_BASE: u16 =
+    @get_int(tile_cfg.addresses.TIMESTAMP_COUNTER) / tile_cfg.word_size;
+
+var mark0: u16 = 0;
+var mark1: u16 = 0;
+var mark2: u16 = 0;
+
+var time_buf_u16 = @zeros([3]u16);
+var ptr_time_buf_u16: [*]u16 = &time_buf_u16;
+
+// Mirrors the leaf: activate the witness, take the marker, then leave. The
+// only difference from the benchmark is how we leave -- by returning rather
+// than by suspending.
+task producer() void {
+    @activate(WITNESS);
+    mark0 = @get_config(TSC_BASE);
+}
+
+task witness() void {
+    mark1 = @get_config(TSC_BASE);
+    @activate(CONSUMER);
+}
+
+// Stands in for the resumed leaf.
+task consumer() void {
+    mark2 = @get_config(TSC_BASE);
+    sys_mod.unblock_cmd_stream();
+}
+
+fn f_start() void {
+    timestamp.enable_tsc();
+    @activate(PRODUCER);
+}
+
+fn f_read_timestamps() void {
+    time_buf_u16[0] = mark0;
+    time_buf_u16[1] = mark1;
+    time_buf_u16[2] = mark2;
+    sys_mod.unblock_cmd_stream();
+}
+
+comptime {
+    @bind_local_task(producer, PRODUCER);
+    @bind_local_task(witness, WITNESS);
+    @bind_local_task(consumer, CONSUMER);
+}
+
+comptime {
+    @export_symbol(ptr_time_buf_u16, "time_buf_u16");
+    @export_symbol(f_start);
+    @export_symbol(f_read_timestamps);
+}

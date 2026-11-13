@@ -1,0 +1,88 @@
+// Copyright 2025 Cerebras Systems.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Introduce a fifo to buffer the data from H2D, so the H2D can
+// finish as long as size does not exceed the capacity of the fifo
+//
+// H2D --> fifo --> C1 --> addh() --> D2H
+
+param memcpy_params;
+
+param size: i16;
+param main: u16;
+
+// Colors
+param C1: color;
+
+// Queue IDs
+const h2d_1_iq: input_queue = @get_input_queue(2);
+const d2h_1_oq: output_queue = @get_output_queue(3);
+const C1_iq: input_queue = @get_input_queue(4);
+const C1_oq: output_queue = @get_output_queue(5);
+
+// Task IDs
+const main_task_id: local_task_id = @get_local_task_id(8);
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+
+var fifo_buffer = @zeros([1024]i16);
+const fifo = @allocate_fifo(fifo_buffer);
+
+const INFINITE_DSD_LEN: u16 = 0x7fff;
+
+const h2d_in_dsd = @get_dsd(fabin_dsd, .{
+  .extent = INFINITE_DSD_LEN,
+  .input_queue = h2d_1_iq
+});
+
+const C1_out_dsd = @get_dsd(fabout_dsd, if (@is_arch("wse3")) .{
+  .extent = INFINITE_DSD_LEN,
+  .output_queue = C1_oq
+} else .{
+  .extent = INFINITE_DSD_LEN,
+  .fabric_color = C1,
+  .output_queue = C1_oq
+});
+
+const C1_in_dsd = @get_dsd(fabin_dsd, .{
+  .extent = size,
+  .input_queue = C1_iq
+});
+
+const d2h_out_dsd = sys_mod.get_streaming_fabout_dsd(@get_color(@bitcast(u16, sys_mod.MEMCPYD2H_1)), size, d2h_1_oq);
+
+const buf = [1]i16{ 1 };
+const one_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{size} -> buf[0] });
+
+task main_task() void {
+
+  // Move from the fabric to the FIFO
+  @mov16(fifo, h2d_in_dsd, .{ .async = true });
+
+  // Move from the FIFO to C1
+  @mov16(C1_out_dsd, fifo, .{ .async = true });
+
+  @add16(d2h_out_dsd, C1_in_dsd, one_dsd, .{ .async = true });
+}
+
+comptime {
+  // activate local task main_task_id at startup
+  @bind_local_task(main_task, main_task_id);
+  @activate(main_task_id);
+
+  @initialize_queue(h2d_1_iq,  .{ .color = @get_color(@bitcast(u16, sys_mod.MEMCPYH2D_1)) });
+  @initialize_queue(d2h_1_oq, if (@is_arch("wse3")) .{ .color = @get_color(@bitcast(u16, sys_mod.MEMCPYD2H_1)) } else .{});
+  @initialize_queue(C1_iq, .{ .color = C1 });
+  @initialize_queue(C1_oq, if (@is_arch("wse3")) .{ .color = C1 } else .{});
+}
