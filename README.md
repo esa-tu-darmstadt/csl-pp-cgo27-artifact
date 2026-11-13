@@ -13,7 +13,7 @@ The language extensions are part of csl++, an open-source language frontend for 
 - Documentation, with a tutorial and the reference of the language extensions: https://esa-tu-darmstadt.github.io/csl-pp/
 - Source code: https://github.com/esa-tu-darmstadt/csl-pp
 - The package: https://pypi.org/project/csl-pp/
-- Editor support: the VS Code extension "Language Server for CSL" (`esa-tu-darmstadt.csl-lsp`)
+- Editor support: the VS Code extension "Language Server for CSL": https://marketplace.visualstudio.com/items?itemName=esa-tu-darmstadt.csl-lsp
 
 ## What the artifact reproduces
 
