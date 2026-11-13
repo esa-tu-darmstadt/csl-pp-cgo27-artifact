@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import time
 import numpy as np
 
 from cerebras.sdk.runtime.sdkruntimepybind import SdkRuntime     # pylint: disable=no-name-in-module
@@ -99,6 +100,14 @@ runner.memcpy_h2d(symbol_x, X, 0, 0, 1, 1, matrix_cols,
                   streaming=False, data_type=memcpy_dtype, nonblock=False, order=memcpy_order)
 runner.memcpy_h2d(symbol_b, B, 0, 0, 1, 1, matrix_rows,
                   streaming=False, data_type=memcpy_dtype, nonblock=False, order=memcpy_order)
+
+# x and b go to PE (0,0) only, so its row is still busy with these copies when
+# the other rows have finished. On a CS-3 the launches below sometimes arrive
+# during that time and sometimes after it, which changes the measured interval
+# from run to run. Wait, so that they always reach PEs that are all idle.
+# The simulator delivers the commands in the same way in every run.
+if args.cmaddr:
+  time.sleep(2)
 
 print("Launching kernel...")
 # Initialize fiber runtime (untimed).

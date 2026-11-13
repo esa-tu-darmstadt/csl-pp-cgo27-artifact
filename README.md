@@ -87,10 +87,10 @@ cgo27-ae check
 
 `cgo27-ae check` reports every requirement it finds, and then whether the installation is ready to run on the simulator and on a CS-3.
 
-pip installs the compiler csl-pp in the version v2.0.0 from PyPI. The archived version of the artifact on Zenodo also holds that wheel of csl-pp and the source of the same csl-pp release. To install the compiler from the archive instead of PyPI, point pip at the directory with the downloaded wheel:
+pip installs the compiler csl-pp in the version v2.0.0 from PyPI. The archived version of the artifact on Zenodo also holds that wheel of csl-pp and the source of the same csl-pp release. To install the compiler from the archive instead of PyPI, pass the downloaded wheel to pip as well:
 
 ```bash
-pip install --find-links /path/to/downloaded/files ./csl-pp-cgo27-artifact
+pip install /path/to/csl_pp-2.0.0-py3-none-manylinux_2_28_x86_64.whl ./csl-pp-cgo27-artifact
 ```
 
 The other Python packages (numpy, matplotlib, pyelftools, tqdm) come from PyPI either way.
@@ -127,9 +127,9 @@ cgo27-ae hardware                    # reserves a CS-3 through the appliance SDK
 cgo27-ae hardware --cmaddr IP:PORT   # instead, for a system that this host reaches directly
 ```
 
-The artifact compiles every configuration for the full wafer on this host first, and then runs all of them on the system in one job. Without `--cmaddr`, the system is reserved with `SdkLauncher` of the appliance SDK, which the installation with the extra `hardware` provides: each configuration is staged into the job and run on the appliance. With `--cmaddr`, the runners run on this host against the given address, and the appliance SDK is not needed.
+The artifact compiles every configuration for the full wafer on this host first, and then runs all of them on the system, in one job per experiment. Without `--cmaddr`, the system is reserved with `SdkLauncher` of the appliance SDK, which the installation with the extra `hardware` provides: each configuration is staged into the job and run on the appliance. With `--cmaddr`, the runners run on this host against the given address, and the appliance SDK is not needed.
 
-As for the paper, each configuration of Table 1 runs three times and each of Figure 7 once. `--reps` changes that, and `--quick` runs a few configurations only. Cycle counts on hardware vary slightly from run to run.
+As for the paper, each configuration of Table 1 runs three times and each of Figure 7 once. `--reps` changes that, and `--quick` runs a few configurations only. The full run takes about 45 minutes, not counting the wait for the reservation of the system. Cycle counts on hardware vary slightly from run to run.
 
 ## Step 4: the report
 

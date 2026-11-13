@@ -191,7 +191,15 @@ diff -ruN -x 'out-*' -x 'cslc-*.log' ga/gemv-collectives_2d/pe.csl gb/gemv-colle
 diff -ruN -x 'out-*' -x 'cslc-*.log' ga/gemv-collectives_2d/run.py gb/gemv-collectives_2d/run.py
 --- ga/gemv-collectives_2d/run.py	2026-11-13 09:40:57.846480467 +0000
 +++ gb/gemv-collectives_2d/run.py	2026-11-13 09:40:57.859480448 +0000
-@@ -38,7 +38,6 @@
+@@ -17,6 +17,7 @@
+ 
+ import argparse
+ import json
++import time
+ import numpy as np
+ 
+ from cerebras.sdk.runtime.sdkruntimepybind import SdkRuntime     # pylint: disable=no-name-in-module
+@@ -38,7 +39,6 @@
  matrix_rows = int(compile_data['params']['matrix_rows'])
  matrix_cols = int(compile_data['params']['matrix_cols'])
  
@@ -199,7 +207,7 @@ diff -ruN -x 'out-*' -x 'cslc-*.log' ga/gemv-collectives_2d/run.py gb/gemv-colle
  # Use a deterministic seed so that CI results are predictable
  np.random.seed(seed=7)
  
-@@ -46,10 +45,8 @@
+@@ -46,10 +46,8 @@
  X = np.random.rand(matrix_cols).astype(np.float32)
  B = np.random.rand(matrix_rows).astype(np.float32)
  
@@ -210,7 +218,7 @@ diff -ruN -x 'out-*' -x 'cslc-*.log' ga/gemv-collectives_2d/run.py gb/gemv-colle
  runner = SdkRuntime(args.name, cmaddr=args.cmaddr)
  
  memcpy_dtype = MemcpyDataType.MEMCPY_32BIT
-@@ -59,74 +56,68 @@
+@@ -59,74 +57,76 @@
  symbol_x = runner.get_id("x")
  symbol_b = runner.get_id("b")
  symbol_y = runner.get_id("y")
@@ -270,6 +278,14 @@ diff -ruN -x 'out-*' -x 'cslc-*.log' ga/gemv-collectives_2d/run.py gb/gemv-colle
  runner.memcpy_h2d(symbol_b, B, 0, 0, 1, 1, matrix_rows,
                    streaming=False, data_type=memcpy_dtype, nonblock=False, order=memcpy_order)
  
++# x and b go to PE (0,0) only, so its row is still busy with these copies when
++# the other rows have finished. On a CS-3 the launches below sometimes arrive
++# during that time and sometimes after it, which changes the measured interval
++# from run to run. Wait, so that they always reach PEs that are all idle.
++# The simulator delivers the commands in the same way in every run.
++if args.cmaddr:
++  time.sleep(2)
++
  print("Launching kernel...")
 -# Run the kernel
 +# Enable per-PE timestamp counter.

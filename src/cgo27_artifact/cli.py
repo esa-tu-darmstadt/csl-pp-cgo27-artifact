@@ -18,7 +18,6 @@ import importlib.metadata
 import os
 import re
 import shutil
-import statistics
 import subprocess
 import sys
 from pathlib import Path
@@ -220,15 +219,20 @@ def _table1(out, report_dir, lines):
                    check=True, stdout=subprocess.DEVNULL)
     lines.append(f"Table 1 (table1.tex): {', '.join(platforms)}")
 
-    def median_by(rows_):
+    def per_configuration(rows_):
+        """The values that Table 1 shows: like tabulate.py, the minimum of the
+        cycle counts over the repetitions, because a delayed command from the
+        host can only lengthen the measured interval. The other columns are
+        properties of the compiled program and the same in every repetition."""
         groups = {}
         for r in rows_:
             groups.setdefault((r["benchmark"], r["config"], r["arch"], r["target"]), []).append(r)
-        return {k: {c: statistics.median(float(r[c]) for r in g)
-                    for c in ("cycles_send", "tasks_local", "prog_size", "globals_size", "loc")}
+        return {k: {"cycles_send": min(float(r["cycles_send"]) for r in g),
+                    **{c: float(g[0][c])
+                       for c in ("tasks_local", "prog_size", "globals_size", "loc")}}
                 for k, g in groups.items()}
 
-    mine, paper = median_by(own), median_by(recorded)
+    mine, paper = per_configuration(own), per_configuration(recorded)
     worst, outside = {}, []
     for key, values in sorted(mine.items()):
         if key not in paper:
